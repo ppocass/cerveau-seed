@@ -145,7 +145,7 @@ if [ "${1:-}" = "--etat" ]; then
   fi
   echo "Total de notes : $(find notes -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
   if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ]; then
-    echo "⚠ Une fusion est restée en cours — lance « cerveau » pour la régler."
+    echo "Attention, une fusion est restée en cours — lance « cerveau » pour la régler."
   fi
   exit 0
 fi

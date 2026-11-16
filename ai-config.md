@@ -35,7 +35,7 @@ Test à faire avant chaque réponse : *« y a-t-il du neuf dans ce tour qui n'es
 dans une note (ou dans `me.md`) ? »* Si oui, tu écris d'abord, puis tu mets à jour
 `notes/MEMORY.md` si c'est une nouvelle note.
 
-⚠️ **Ce qui fait la valeur d'une note, ce n'est pas l'avancement.** « On en est là » est
+**Attention, ce qui fait la valeur d'une note, ce n'est pas l'avancement.** « On en est là » est
 un tableau de bord : ça se périme en un jour. Ce qui compte, c'est **ce que la prochaine
 session ne doit pas avoir à réapprendre** :
 - les **erreurs déjà payées** et ce qu'elles ont coûté (pistes abandonnées, bugs vicieux,

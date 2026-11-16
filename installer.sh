@@ -55,11 +55,11 @@ installer_cerveau() {
   # ---------------------------------------------------------------------------
   local manquant=0
   for outil in git python3; do
-    command -v "$outil" >/dev/null 2>&1 || { echo "  ✗ $outil n'est pas installé."; manquant=1; }
+    command -v "$outil" >/dev/null 2>&1 || { echo "  ERREUR : $outil n'est pas installé."; manquant=1; }
   done
 
   if ! command -v claude >/dev/null 2>&1; then
-    echo "  ✗ claude n'est pas installé."
+    echo "  ERREUR : claude n'est pas installé."
     echo
     echo "Installe d'abord Claude Code :"
     echo "  curl -fsSL https://claude.ai/install.sh | bash"
@@ -69,7 +69,7 @@ installer_cerveau() {
 
   if ! command -v gh >/dev/null 2>&1; then
     echo
-    echo "  ✗ gh (GitHub CLI) n'est pas installé."
+    echo "  ERREUR : gh (GitHub CLI) n'est pas installé."
     echo "    Sur Mint / Debian / Ubuntu :  sudo apt install gh"
     echo "    Puis connecte-toi :           gh auth login"
     return 1
@@ -81,26 +81,26 @@ installer_cerveau() {
 
   if ! gh auth status >/dev/null 2>&1; then
     echo
-    echo "  ✗ tu n'es pas connecté à GitHub."
+    echo "  ERREUR : tu n'es pas connecté à GitHub."
     echo "    Lance :  gh auth login"
     return 1
   fi
-  echo "  ✓ git, python3, claude et gh sont là, et GitHub est connecté."
+  echo "  ok : git, python3, claude et gh sont là, et GitHub est connecté."
 
   local COMPTE
   COMPTE=$(gh api user --jq .login </dev/null 2>/dev/null || true)
   if [ -z "$COMPTE" ]; then
-    echo "  ✗ impossible de lire ton identifiant GitHub."
+    echo "  ERREUR : impossible de lire ton identifiant GitHub."
     return 1
   fi
-  echo "  ✓ compte GitHub : $COMPTE"
+  echo "  ok : compte GitHub : $COMPTE"
 
   # gh et git sont deux choses : « gh auth login » connecte gh, mais git a besoin
   # du credential helper pour cloner et pousser en HTTPS sur un dépôt privé.
   if ! git config --global --get-regexp 'credential.*helper' 2>/dev/null | grep -q 'gh'; then
     gh auth setup-git </dev/null >/dev/null 2>&1 \
-      && echo "  ✓ git branché sur le compte GitHub" \
-      || echo "  ⚠ git n'a pas pu être branché automatiquement sur GitHub"
+      && echo "  ok : git branché sur le compte GitHub" \
+      || echo "  Attention : git n'a pas pu être branché automatiquement sur GitHub"
   fi
 
   local EMAIL NOMGIT
@@ -177,9 +177,9 @@ CE QUE TU PEUX FAIRE
 
 Dossier sauvegardé : $SAUVEGARDE
 EOF
-      echo "  ✓ sauvegarde complète sur le Bureau : $(basename "$SAUVEGARDE")"
+      echo "  ok : sauvegarde complète sur le Bureau : $(basename "$SAUVEGARDE")"
     else
-      echo "  ⚠ sauvegarde impossible (droits ?) — l'installation continue, rien n'est supprimé"
+      echo "  Attention : sauvegarde impossible (droits ?) — l'installation continue, rien n'est supprimé"
     fi
   fi
 
@@ -194,13 +194,13 @@ EOF
     git -C "$DESTINATION" config user.email "$EMAIL" 2>/dev/null || true
     git -C "$DESTINATION" config user.name "$NOMGIT" 2>/dev/null || true
     if [ -x "$DESTINATION/bin/cerveau" ]; then
-      "$DESTINATION/bin/cerveau" </dev/null || echo "  ⚠ synchronisation distante impossible (réseau ?), copie locale conservée"
+      "$DESTINATION/bin/cerveau" </dev/null || echo "  Attention : synchronisation distante impossible (réseau ?), copie locale conservée"
     fi
 
   elif gh repo view "$COMPTE/$NOM_DEPOT" </dev/null >/dev/null 2>&1; then
     echo "  → ton dépôt privé ($COMPTE/$NOM_DEPOT) existe déjà, je le récupère"
     if ! git clone --quiet "$URL_PRIVE" "$DESTINATION" </dev/null; then
-      echo "  ✗ impossible de récupérer le dépôt $COMPTE/$NOM_DEPOT"
+      echo "  ERREUR : impossible de récupérer le dépôt $COMPTE/$NOM_DEPOT"
       return 1
     fi
     # Un dépôt qui existe mais n'a AUCUN commit (créé à la main puis abandonné)
@@ -209,7 +209,7 @@ EOF
     if [ ! -f "$DESTINATION/ai-config.md" ]; then
       echo "  → ce dépôt est vide (aucun contenu dedans) : je le rembourre avec le modèle"
       if ! git clone --quiet --depth 1 "$DEPOT_MODELE" "$DESTINATION/.modele-tmp" </dev/null; then
-        echo "  ✗ dépôt vide et modèle inaccessible : je m'arrête."
+        echo "  ERREUR : dépôt vide et modèle inaccessible : je m'arrête."
         echo "    Vérifie ta connexion, puis relance l'installateur."
         return 1
       fi
@@ -218,15 +218,15 @@ EOF
         | (cd "$DESTINATION" && tar xf -) 2>/dev/null
       rm -rf "$DESTINATION/.modele-tmp" "$DESTINATION/tests" "$DESTINATION/machines.md"
       if [ ! -f "$DESTINATION/ai-config.md" ] || [ ! -f "$DESTINATION/bin/cerveau" ]; then
-        echo "  ✗ impossible de rembourrer le dépôt vide : je m'arrête."
+        echo "  ERREUR : impossible de rembourrer le dépôt vide : je m'arrête."
         return 1
       fi
       git -C "$DESTINATION" add -A 2>/dev/null
       git -C "$DESTINATION" -c user.email="$EMAIL" -c user.name="$NOMGIT" \
           commit --quiet -m "cerveau : contenu de départ" 2>/dev/null
       git -C "$DESTINATION" push --quiet 2>/dev/null \
-        || echo "  ⚠ contenu en place, mais l'envoi sur GitHub a échoué (réseau ?)"
-      echo "  ✓ dépôt vide rempli avec le contenu de départ"
+        || echo "  Attention : contenu en place, mais l'envoi sur GitHub a échoué (réseau ?)"
+      echo "  ok : dépôt vide rempli avec le contenu de départ"
     fi
 
   else
@@ -234,7 +234,7 @@ EOF
     echo "  → première installation : je crée ton dépôt privé ($COMPTE/$NOM_DEPOT)"
 
     if ! git clone --quiet --depth 1 "$DEPOT_MODELE" "$DESTINATION" </dev/null; then
-      echo "  ✗ impossible de récupérer le modèle de départ ($DEPOT_MODELE)"
+      echo "  ERREUR : impossible de récupérer le modèle de départ ($DEPOT_MODELE)"
       echo "    Vérifie ta connexion internet."
       return 1
     fi
@@ -243,7 +243,7 @@ EOF
     if [ -f "$DESTINATION/ai-config.md" ] && [ -f "$DESTINATION/installer.sh" ]; then
       rm -rf "$DESTINATION/.git" "$DESTINATION/tests" "$DESTINATION/machines.md"
     else
-      echo "  ✗ le contenu récupéré n'est pas celui attendu — je m'arrête sans rien supprimer."
+      echo "  ERREUR : le contenu récupéré n'est pas celui attendu — je m'arrête sans rien supprimer."
       return 1
     fi
 
@@ -255,7 +255,7 @@ EOF
 
     if ! gh repo create "$COMPTE/$NOM_DEPOT" --private \
           --source="$DESTINATION" --remote=origin --push </dev/null >/dev/null 2>&1; then
-      echo "  ✗ impossible de créer le dépôt GitHub."
+      echo "  ERREUR : impossible de créer le dépôt GitHub."
       echo "    Essaie à la main :  gh repo create $NOM_DEPOT --private --source=$DESTINATION --push"
       return 1
     fi
@@ -265,7 +265,7 @@ EOF
   # (ainsi, même sur un PC tout neuf où git global n'est pas configuré, tout commit marche).
   git -C "$DESTINATION" config user.email "$EMAIL" 2>/dev/null || true
   git -C "$DESTINATION" config user.name "$NOMGIT" 2>/dev/null || true
-  echo "  ✓ cerveau prêt dans $DESTINATION"
+  echo "  ok : cerveau prêt dans $DESTINATION"
 
   # ---------------------------------------------------------------------------
   # 2 bis. Rassembler les anciennes notes de Claude Code dans un sas (.a-importer)
@@ -392,12 +392,12 @@ PY
 
   if [ "${NB_FRAGMENTS:-0}" -gt 0 ] 2>/dev/null; then
     NBLOTS=$(find "$DESTINATION/.a-importer" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
-    echo "  ✓ $NB_FRAGMENTS ancien(s) élément(s) trouvé(s) — répartis en $NBLOTS lot(s)"
+    echo "  ok : $NB_FRAGMENTS ancien(s) élément(s) trouvé(s) — répartis en $NBLOTS lot(s)"
     if [ "${CERVEAU_SANS_IMPORT:-0}" = "1" ]; then
       echo "  → import reporté (CERVEAU_SANS_IMPORT=1) : lance « cerveau --importer » quand tu veux"
     else
       echo "  → Claude les lit et les réécrit aux règles du cerveau (une session, effort bas)…"
-      "$DESTINATION/bin/cerveau" --importer </dev/null || echo "  ⚠ import interrompu — relance « cerveau --importer » plus tard"
+      "$DESTINATION/bin/cerveau" --importer </dev/null || echo "  Attention : import interrompu — relance « cerveau --importer » plus tard"
     fi
   fi
 
@@ -407,14 +407,14 @@ PY
   cat > "$DESTINATION/machines.md" <<EOF
 # Où je suis
 
-> ⚠️ Ce fichier n'est **pas** sur GitHub : il change d'un ordinateur à l'autre.
+> Attention, ce fichier n'est **pas** sur GitHub : il change d'un ordinateur à l'autre.
 > C'est l'installateur qui l'a créé, avec le bon nom dedans.
 
 je suis sur : $NOM_MACHINE
 
 *(le catalogue de toutes les machines est dans \`notes/ordinateurs.md\` — celui-là est partagé.)*
 EOF
-  echo "  ✓ machine enregistrée : $NOM_MACHINE"
+  echo "  ok : machine enregistrée : $NOM_MACHINE"
 
   # ---------------------------------------------------------------------------
   # 4. Le mot d'accueil de Claude (~/.claude/CLAUDE.md)
@@ -475,21 +475,21 @@ PY
 
   else
     printf '%s\n' "$BLOC" > "$ACCUEIL"
-    echo "  ✓ mot d'accueil écrit dans $ACCUEIL"
+    echo "  ok : mot d'accueil écrit dans $ACCUEIL"
   fi
 
   # ---------------------------------------------------------------------------
   # 5. La commande cerveau dans ~/.local/bin/cerveau
   # ---------------------------------------------------------------------------
   if [ ! -f "$DESTINATION/bin/cerveau" ]; then
-    echo "  ✗ $DESTINATION/bin/cerveau est absent : l'installation ne peut pas continuer."
+    echo "  ERREUR : $DESTINATION/bin/cerveau est absent : l'installation ne peut pas continuer."
     echo "    Le dossier du cerveau est incomplet. Relance l'installateur ;"
     echo "    si ça se reproduit, supprime $DESTINATION et relance."
     return 1
   fi
   cp -f "$DESTINATION/bin/cerveau" "$HOME/.local/bin/cerveau"
   chmod 755 "$HOME/.local/bin/cerveau" "$DESTINATION/bin/cerveau"
-  echo "  ✓ commande installée dans ~/.local/bin/cerveau"
+  echo "  ok : commande installée dans ~/.local/bin/cerveau"
 
   # ---------------------------------------------------------------------------
   # 6. Brancher autoMemoryDirectory, permissions et hook SessionStart (--auto)
@@ -572,9 +572,9 @@ with open(chemin, "w", encoding="utf-8") as f:
 PY
 
   if python3 -m json.tool "$REGLAGES" >/dev/null 2>&1; then
-    echo "  ✓ mémoire automatique et synchro de démarrage branchées"
+    echo "  ok : mémoire automatique et synchro de démarrage branchées"
   else
-    echo "  ⚠ réglages non modifiés — vérifie $REGLAGES"
+    echo "  Attention : réglages non modifiés — vérifie $REGLAGES"
   fi
 
   # ---------------------------------------------------------------------------
@@ -595,7 +595,7 @@ PY
   echo "Mode d'emploi complet :       $DESTINATION/MODE-EMPLOI.md"
   if [ -d "$SAUVEGARDE" ]; then
     echo
-    echo "⚠ Une sauvegarde de tes fichiers d'avant a été posée sur le Bureau :"
+    echo "Attention, une sauvegarde de tes fichiers d'avant a été posée sur le Bureau :"
     echo "    $(basename "$SAUVEGARDE")"
     echo "  Garde-la quelque temps. Rien n'a été supprimé ; c'est toi qui décides"
     echo "  quand la retirer (ouvre son LISEZ-MOI.txt pour le détail)."

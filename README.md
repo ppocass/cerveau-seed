@@ -7,7 +7,7 @@ et machines.
 **Synchronisé via un dépôt GitHub privé** : quand je change d'ordinateur, une commande me
 redonne immédiatement toute ma mémoire.
 
-👉 **Pour tout savoir (installation, premier remplissage, commandes) : lire [`MODE-EMPLOI.md`](MODE-EMPLOI.md).**
+**Pour tout savoir (installation, premier remplissage, commandes) : lire [`MODE-EMPLOI.md`](MODE-EMPLOI.md).**
 
 ---
 
@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/ppocass/cerveau-seed/main/installer
 
 ---
 
-## 🤖 Si tu es un agent IA (Claude Code…) à qui on a donné ce lien pour l'installer
+## Si tu es un agent IA (Claude Code…) à qui on a donné ce lien pour l'installer
 
 Ton utilisateur veut que tu installes ce cerveau à sa place. Suis exactement ces étapes :
 
@@ -35,7 +35,7 @@ Ton utilisateur veut que tu installes ce cerveau à sa place. Suis exactement ce
    ```bash
    curl -fsSL https://raw.githubusercontent.com/ppocass/cerveau-seed/main/installer.sh | CERVEAU_SANS_IMPORT=1 bash
    ```
-   ⚠️ Ne lance pas l'installateur sans `CERVEAU_SANS_IMPORT=1` : l'import démarre une autre
+   Attention, ne lance pas l'installateur sans `CERVEAU_SANS_IMPORT=1` : l'import démarre une autre
    session Claude qui peut durer jusqu'à 15 minutes, et ta commande serait coupée en plein milieu.
 3. **Lance l'import de ses anciennes notes en arrière-plan** (s'il en a), puis attends qu'il finisse :
    ```bash
@@ -47,7 +47,7 @@ Ton utilisateur veut que tu installes ce cerveau à sa place. Suis exactement ce
    sauvegarde posée sur son Bureau, et qu'il doit **redémarrer Claude Code** pour que la
    mémoire soit chargée.
 
-**⚠️ Si quoi que ce soit se passe mal, à n'importe quelle étape :** n'essaie pas de bricoler
+**Attention, si quoi que ce soit se passe mal, à n'importe quelle étape :** n'essaie pas de bricoler
 une solution, arrête-toi et préviens ton utilisateur tout de suite avec un rapport détaillé,
 qu'il pourra transmettre tel quel à la personne qui lui a donné ce cerveau :
 - l'étape où ça a cassé et la commande exacte lancée ;

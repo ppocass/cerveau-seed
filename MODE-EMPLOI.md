@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/ppocass/cerveau-seed/main/installer
 - **Si tu avais déjà un `~/.claude/CLAUDE.md` ou un `settings.json`** : rien n'est écrasé.
   Le bloc du cerveau est ajouté proprement à la suite de tes règles existantes.
 
-### 🔒 Ce qui est sauvegardé, et ce qui n'est jamais touché
+### Ce qui est sauvegardé, et ce qui n'est jamais touché
 
 **L'installateur ne supprime aucun fichier.** Il ne fait qu'**ajouter** : son bloc à la fin
 de `~/.claude/CLAUDE.md`, et ses clés dans `~/.claude/settings.json`. Tes règles et tes

@@ -45,7 +45,7 @@ Le contenu de la note.
 | `machine` | `"commun"` · le nom d'un ordinateur (voir `notes/ordinateurs.md`) | où ça existe |
 | `mots-cles` | `"3 à 6 mots, séparés par des virgules"` | retrouver par thème |
 
-### ⚠️ Le piège YAML : toujours mettre les chaînes entre guillemets
+### Attention, le piège YAML : toujours mettre les chaînes entre guillemets
 
 Une valeur contenant `:` ou des caractères spéciaux sans guillemets casse l'en-tête YAML
 en silence et rend la note illisible. Mets **toujours** `description` et `mots-cles` (et de
@@ -116,7 +116,7 @@ Elle porte `machine: "<nom-de-la-machine>"` dans son en-tête **et** un bandeau 
 le titre :
 
 ```markdown
-> ⚠️ Ceci n'existe que sur **portable-mint** ; sur un autre poste, demande avant d'agir.
+> Attention, ceci n'existe que sur **portable-mint** ; sur un autre poste, demande avant d'agir.
 ```
 
 ---
