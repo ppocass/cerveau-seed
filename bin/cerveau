@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# cerveau — synchronise la mémoire avec GitHub.
+#
+#   cerveau            envoie ce qui attend, récupère ce qui est neuf
+#   cerveau --etat     montre seulement où on en est, sans rien toucher
+#   cerveau --importer fait digérer par Claude (Sonnet, effort bas) un lot
+#                      d'anciennes notes en attente dans .a-importer/
+#   cerveau --auto     pour le démarrage de session : ne fait rien si la dernière
+#                      synchro a moins de 4 heures, et plafonne le réseau à 5 s.
+#
+# Principe : rien ne se perd. Si deux ordinateurs ont touché la même note, la
+# version locale est gardée sous un autre nom (.conflit-<machine>-…) au lieu
+# d'être écrasée, et le chemin normal reçoit la version de l'autre ordinateur.
+#
+# Ne demande jamais de mot de passe : git utilise gh ou la clé SSH configurée.
+
+set -uo pipefail
+
+export GIT_TERMINAL_PROMPT=0
+
+# ---------------------------------------------------------------------------
+# Retrouver la racine du cerveau
+# ---------------------------------------------------------------------------
+trouver_cerveau() {
+  local essai
+
+  if [ -n "${CERVEAU_DIR:-}" ] && [ -f "$CERVEAU_DIR/ai-config.md" ]; then
+    printf '%s\n' "$CERVEAU_DIR"; return 0
+  fi
+
+  essai="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  if [ -n "$essai" ] && [ -f "$essai/ai-config.md" ]; then
+    printf '%s\n' "$essai"; return 0
+  fi
+
+  if [ -f "$HOME/cerveau/ai-config.md" ]; then
+    printf '%s\n' "$HOME/cerveau"; return 0
+  fi
+
+  for essai in "$HOME/Cerveau" "$HOME/brain"; do
+    if [ -f "$essai/ai-config.md" ]; then printf '%s\n' "$essai"; return 0; fi
+  done
+
+  return 1
+}
+
+if ! CERVEAU="$(trouver_cerveau)"; then
+  echo "cerveau : je ne trouve pas le dossier du cerveau."
+  echo "  Cherché : à côté de ce script, et dans $HOME/cerveau."
+  echo "  S'il est ailleurs :  CERVEAU_DIR=/chemin/du/cerveau cerveau"
+  exit 1
+fi
+
+cd "$CERVEAU" 2>/dev/null || { echo "cerveau : dossier introuvable ($CERVEAU)"; exit 1; }
+
+if [ ! -d .git ]; then
+  echo "cerveau : $CERVEAU n'est pas un dépôt git. Relance l'installateur."
+  exit 1
+fi
+
+# Garde-fou : si notes/ a disparu, une synchronisation propagerait la suppression
+# à toutes les machines. On refuse, et on dit comment le recréer.
+if [ ! -d notes ]; then
+  echo "cerveau : le dossier notes/ a disparu de $CERVEAU."
+  echo "  Je ne synchronise rien tant qu'il n'est pas revenu — sinon la suppression"
+  echo "  arriverait sur tous les autres ordinateurs."
+  echo "  Pour le recréer :  mkdir -p $CERVEAU/notes"
+  echo "  Pour récupérer ce qui était dedans :  git -C $CERVEAU checkout -- notes"
+  exit 1
+fi
+
+HORODATAGE=".derniere-synchro"
+DELAI_AUTO=14400   # 4 heures
+MAX_ESSAIS=2
+maintenant=$(date +%s)
+
+derniere_synchro() {
+  if [ -f "$HORODATAGE" ]; then cat "$HORODATAGE" 2>/dev/null || echo 0; else echo 0; fi
+}
+
+nom_machine() {
+  local n
+  n=$(sed -n 's/^je suis sur *: *//p' machines.md 2>/dev/null | head -1 | tr -d ' \r')
+  [ -z "$n" ] && n=$(hostname 2>/dev/null | cut -d. -f1 | tr -d ' \r')
+  [ -z "$n" ] && n="machine"
+  printf '%s\n' "$n"
+}
+
+# Identité git : celle de l'utilisateur s'il en a une, sinon on signe « cerveau ».
+if git config user.email >/dev/null 2>&1 && git config user.name >/dev/null 2>&1; then
+  IDENTITE=0
+else
+  IDENTITE=1
+fi
+
+gitc() {
+  if [ "$IDENTITE" = "1" ]; then
+    git -c user.email="cerveau@localhost" -c user.name="cerveau" "$@"
+  else
+    git "$@"
+  fi
+}
+
+# Extrait la version LOCALE (HEAD, section 1) d'un fichier marqué par un conflit git.
+extraire_local() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<<<<<<< /       { section = 1; next }
+    /^\|\|\|\|\|\|\|/ { section = 3; next }
+    /^=======$/       { section = 2; next }
+    /^>>>>>>> /       { section = 0; next }
+                      { if (section == 0 || section == 1) print }
+  ' "$1"
+}
+
+# Extrait la version DISTANTE (origin, section 2) d'un fichier marqué par un conflit git.
+extraire_distant() {
+  awk '
+    { sub(/\r$/, "") }
+    /^<<<<<<< /       { section = 1; next }
+    /^\|\|\|\|\|\|\|/ { section = 3; next }
+    /^=======$/       { section = 2; next }
+    /^>>>>>>> /       { section = 0; next }
+                      { if (section == 0 || section == 2) print }
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# --etat : rien à faire, juste regarder
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--etat" ]; then
+  echo "Dossier : $CERVEAU"
+  echo "Machine : $(nom_machine)"
+  echo "Notes non enregistrées : $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    echo "À envoyer : $(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)   ·   À récupérer : $(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+  else
+    echo "Aucun dépôt distant configuré — relance l'installateur."
+  fi
+  ts=$(derniere_synchro)
+  if [ "$ts" -gt 0 ] 2>/dev/null; then
+    echo "Dernière synchronisation : il y a $(( (maintenant - ts) / 60 )) min"
+  else
+    echo "Jamais synchronisé."
+  fi
+  echo "Total de notes : $(find notes -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ]; then
+    echo "⚠ Une fusion est restée en cours — lance « cerveau » pour la régler."
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --importer : faire digérer par Claude une fois les anciennes notes
+#              déposées par l'installateur dans .a-importer/ (un lot à la fois)
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--importer" ]; then
+  SAS="$CERVEAU/.a-importer"
+  if [ ! -d "$SAS" ]; then
+    echo "cerveau : rien à importer ($SAS n'existe pas)."
+    exit 0
+  fi
+
+  LOT=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | sort | head -1)
+  if [ -z "$LOT" ]; then
+    rmdir "$SAS" 2>/dev/null || true
+    echo "cerveau : tout a été importé, rien ne reste dans .a-importer/."
+    exit 0
+  fi
+
+  if [ -f "$SAS/.en-cours" ]; then
+    echo "cerveau : une importation est déjà en cours."
+    exit 0
+  fi
+  : > "$SAS/.en-cours"
+  trap 'rm -f "$SAS/.en-cours" 2>/dev/null' EXIT INT TERM
+
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "cerveau : la commande « claude » est introuvable, impossible d'importer."
+    echo "  Les notes sont gardées dans $SAS — relance « cerveau --importer » plus tard."
+    exit 1
+  fi
+
+  RESTANTS=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+  echo "cerveau : importation de $(basename "$LOT") (1 lot sur $RESTANTS)…"
+  echo "  Claude (Sonnet, effort bas) lit et réécrit ces notes aux règles du cerveau."
+
+  # La commande est ensuite proposée à Claude par son nom court ; on s'assure qu'il
+  # est trouvable même si ~/.local/bin n'est pas dans le PATH de la session.
+  export PATH="$HOME/.local/bin:$PATH"
+
+  PROMPT="Tu vas assimiler un lot d'anciennes notes dans ma mémoire permanente.
+
+Le fichier à lire est : $LOT
+Il contient des notes que Claude Code avait écrites avant l'installation du cerveau, regroupées par projet source, avec le nom de l'ordinateur d'origine.
+
+Ce que tu dois faire, en une seule passe :
+1. Lis le lot en entier (un seul Read).
+2. Pour chaque projet ou sujet distinct, écris ou enrichis UNE note dans ./notes/ en suivant strictement memory-config.md : frontmatter YAML avec name, description entre guillemets, metadata (node_type: memory, type, statut, machine, mots-cles).
+3. Fusionne les fragments qui parlent du même projet : une note par projet, pas un fichier par fragment.
+4. Supprime tous les chemins absolus (/home/..., /Users/..., C:\\...) : décris l'endroit par son nom (dépôt, machine, service) et mets machine: \"<nom de la machine d'origine>\" quand c'est propre à un poste.
+5. Corrige les liens : [[nom-de-la-note]] sans chemin ni .md.
+6. Extrais en priorité les erreurs déjà payées, les endroits, les décisions et leur pourquoi, les contraintes et les chiffres de référence. Rien de chronologique.
+7. Complète ./me.md (qui je suis, comment je travaille) et ./notes/ordinateurs.md (la machine d'origine et ce qu'elle a de particulier) avec ce que le lot t'apprend.
+8. Mets à jour ./notes/MEMORY.md : une ligne par note, avec sa description.
+9. Quand c'est fini, supprime le fichier du lot : $LOT
+
+Ne me pose aucune question : fais au mieux avec ce que le lot contient. Ne touche à rien d'autre dans le dossier."
+
+  # Modèle d'import : Sonnet (bon rapport qualité/coût pour du classement), effort bas.
+  # Surchargeable : CERVEAU_MODELE_IMPORT="auto:cc-flash" cerveau --importer
+  MODELE_IMPORT="${CERVEAU_MODELE_IMPORT:-sonnet}"
+  EFFORT_IMPORT="${CERVEAU_EFFORT_IMPORT:-low}"
+
+  lancer_import() {
+    # $1 = "avec" (modèle/effort explicites) ou "sans"
+    if [ "$1" = "avec" ]; then
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 900 claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
+          --permission-mode acceptEdits --add-dir "$CERVEAU"
+      else
+        claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
+          --permission-mode acceptEdits --add-dir "$CERVEAU"
+      fi
+    else
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 900 claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU"
+      else
+        claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU"
+      fi
+    fi
+  }
+
+  lancer_import avec
+  CODE_IMPORT=$?
+  # Si le modèle « sonnet » n'existe pas sur cette installation (route proxy, autre
+  # abonnement), on retente une fois avec le modèle par défaut de la session.
+  if [ "$CODE_IMPORT" -ne 0 ] && [ -f "$LOT" ]; then
+    echo "  (le modèle « $MODELE_IMPORT » n'est pas disponible ici — je réessaie avec le modèle par défaut)"
+    lancer_import sans
+    CODE_IMPORT=$?
+  fi
+
+  # Le lot doit avoir été supprimé par Claude. S'il reste, c'est que la session
+  # n'a rien fait (Claude non connecté, coupure, quota) : on ne dit PAS « importé ».
+  RESTANTS=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+  rm -f "$SAS/.en-cours" 2>/dev/null
+
+  if [ -f "$LOT" ]; then
+    echo
+    echo "cerveau : l'importation n'a PAS été faite."
+    echo "  La session Claude n'a rien écrit : elle s'est arrêtée avant (souvent parce"
+    echo "  que Claude Code n'est pas connecté sur ce poste, ou par manque de quota)."
+    if [ "${CODE_IMPORT:-0}" -ne 0 ]; then
+      echo "  Code de retour de la session : $CODE_IMPORT"
+    fi
+    echo "  Le lot est intact dans $SAS — rien n'est perdu."
+    echo "  À faire : vérifie avec  claude  que tu es bien connecté, puis relance"
+    echo "            cerveau --importer"
+    exit 1
+  fi
+
+  # Le lot a bien été consommé : on note ce qui a été traité pour ne pas le refaire.
+  if [ ! -d "$SAS" ] || [ -z "$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null)" ]; then
+    mkdir -p "$SAS/traites" 2>/dev/null || true
+  fi
+
+  echo "cerveau : lot importé."
+  if [ "$RESTANTS" -gt 0 ] 2>/dev/null; then
+    echo "  Il reste $RESTANTS lot(s). Lance « cerveau --importer » quand tu veux la suite."
+  fi
+
+  # Puis on synchronise normalement (commit + push de ce que Claude vient d'écrire).
+  # On sauvegarde d'abord les arguments : sans ça, `exec "$0"` relançait la commande
+  # sans argument et l'utilisateur ne voyait qu'une synchro muette.
+  set --
+  exec "$0"
+fi
+
+# ---------------------------------------------------------------------------
+# --auto : au démarrage de session (plafond 5 s, silence si < 4 h)
+# ---------------------------------------------------------------------------
+AUTO=0
+DUREE_TIMEOUT=25
+if [ "${1:-}" = "--auto" ]; then
+  AUTO=1
+  DUREE_TIMEOUT=5
+  ts=$(derniere_synchro)
+  if [ "$ts" -gt 0 ] 2>/dev/null && [ $(( maintenant - ts )) -lt "$DELAI_AUTO" ]; then
+    exit 0          # moins de 4 h : on ne fait rien, et on ne dit rien
+  fi
+fi
+
+if command -v timeout >/dev/null 2>&1; then
+  LIMITE="timeout $DUREE_TIMEOUT"
+elif command -v gtimeout >/dev/null 2>&1; then
+  LIMITE="gtimeout $DUREE_TIMEOUT"
+else
+  LIMITE=""
+fi
+
+dire()     { [ "$AUTO" = "1" ] || echo "$@"; }
+prevenir() { echo "$@"; }      # un conflit se signale toujours
+
+# ---------------------------------------------------------------------------
+# Un seul cerveau à la fois (deux sessions peuvent lancer --auto ensemble)
+# ---------------------------------------------------------------------------
+VERROU=".git/cerveau.lock"
+
+mtime_dossier() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$maintenant"
+}
+
+if ! mkdir "$VERROU" 2>/dev/null; then
+  age=$(( maintenant - $(mtime_dossier "$VERROU") ))
+  if [ "$age" -gt 60 ]; then
+    rmdir "$VERROU" 2>/dev/null || true
+    mkdir "$VERROU" 2>/dev/null || {
+      [ "$AUTO" = "1" ] && exit 0
+      echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
+      exit 0
+    }
+  else
+    [ "$AUTO" = "1" ] && exit 0
+    echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
+    exit 0
+  fi
+fi
+trap 'rmdir "$VERROU" 2>/dev/null || true' EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Se remettre d'une fusion ou d'un rebase interrompu lors d'une exécution tuée
+# ---------------------------------------------------------------------------
+if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+  git rebase --abort 2>/dev/null || rm -rf .git/rebase-merge .git/rebase-apply
+  dire "cerveau : une fusion interrompue a été nettoyée, je repars proprement."
+fi
+if [ -f .git/MERGE_HEAD ]; then
+  git merge --abort 2>/dev/null || rm -f .git/MERGE_HEAD .git/MERGE_MSG .git/MERGE_MODE
+  dire "cerveau : une fusion interrompue a été nettoyée, je repars proprement."
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Enregistrer ce qui traîne (hors ligne, instantané)
+# ---------------------------------------------------------------------------
+# Défense en profondeur : le .gitignore écarte les fichiers parasites (.DS_Store,
+# ._xxx AppleDouble, Thumbs.db…). On les retire aussi de l'index s'ils y sont déjà
+# entrés — sinon ils resteraient versionnés pour toujours, et le cerveau de
+# quelqu'un qui copie le dossier depuis un Mac se remplirait de fichiers invisibles.
+if [ -n "$(git ls-files | grep -E '(^|/)(\._|\.DS_Store|Thumbs\.db|desktop\.ini)' 2>/dev/null)" ]; then
+  git ls-files | grep -E '(^|/)(\._|\.DS_Store|Thumbs\.db|desktop\.ini)' \
+    | xargs -r git rm --cached --quiet 2>/dev/null || true
+fi
+
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  git add -A 2>/dev/null
+  gitc commit -m "notes : synchronisation du $(date '+%d/%m/%Y %H:%M')" --quiet 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Récupérer, puis 3. Envoyer
+# ---------------------------------------------------------------------------
+MACHINE=$(nom_machine)
+CONFLITS=""
+DISTANT_OK=1
+ENVOYEES=0
+RECUPEREES=0
+
+recuperer() {
+  if $LIMITE git fetch --quiet origin 2>/dev/null; then :; else return 1; fi
+
+  local branche avant_head apres_head n
+  branche=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ -z "$branche" ] && return 1
+
+  # S'assurer que l'upstream est suivi si origin/$branche existe
+  if git rev-parse --verify --quiet "origin/$branche" >/dev/null 2>&1; then
+    git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 \
+      || git branch --set-upstream-to="origin/$branche" "$branche" >/dev/null 2>&1 || true
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$branche")" ] && return 0
+  else
+    return 0
+  fi
+
+  avant_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+  if $LIMITE git merge --allow-unrelated-histories --no-edit --quiet "origin/$branche" 2>/dev/null; then
+    apres_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [ -n "$avant_head" ] && [ "$avant_head" != "$apres_head" ]; then
+      n=$(git rev-list --count "$avant_head..origin/$branche" 2>/dev/null || echo 0)
+      if [ "$n" -gt 0 ] 2>/dev/null; then RECUPEREES=$((RECUPEREES + n)); fi
+    fi
+    return 0
+  fi
+
+  # --- Conflit : on garde les deux versions, on ne casse rien ---
+  local fichiers f base garde horo_conflit
+  fichiers=$(git diff --name-only --diff-filter=U 2>/dev/null)
+  if [ -z "$fichiers" ]; then
+    git merge --abort 2>/dev/null || true
+    return 1
+  fi
+
+  horo_conflit=$(date '+%Y%m%d-%H%M%S')
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    base="${f%.md}"
+    garde="${base}.conflit-${MACHINE}-${horo_conflit}.md"
+
+    # 1) Récupérer MA version locale proprement (depuis l'étape 2 de l'index git :ours,
+    #    ou en extrayant la section 1 du fichier en conflit).
+    if git show ":2:$f" > "$garde" 2>/dev/null && grep -q . "$garde" 2>/dev/null; then
+      :
+    elif [ -f "$f" ] && extraire_local "$f" > "$garde" 2>/dev/null && grep -q . "$garde" 2>/dev/null; then
+      :
+    elif [ -f "$f" ]; then
+      cp -f "$f" "$garde" 2>/dev/null
+    fi
+    # Nettoyer les éventuels \r laissés par Windows dans la copie gardée
+    if [ -f "$garde" ]; then
+      awk '{ sub(/\r$/, ""); print }' "$garde" > "${garde}.tmp" 2>/dev/null && mv "${garde}.tmp" "$garde"
+    fi
+
+    # 2) Mettre au chemin normal ($f) la version DISTANTE (:3:$f = theirs), ou à
+    #    défaut (si l'autre ordinateur avait supprimé le fichier) garder la locale.
+    if git show ":3:$f" > "${f}.distant" 2>/dev/null && grep -q . "${f}.distant" 2>/dev/null; then
+      mv -f "${f}.distant" "$f"
+    elif git checkout --theirs -- "$f" 2>/dev/null && ! grep -q '^<<<<<<< ' "$f" 2>/dev/null; then
+      rm -f "${f}.distant" 2>/dev/null
+    elif [ -f "$f" ] && grep -q '^<<<<<<< ' "$f" 2>/dev/null; then
+      rm -f "${f}.distant" 2>/dev/null
+      extraire_distant "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+    elif [ -f "$garde" ]; then
+      rm -f "${f}.distant" 2>/dev/null
+      cp -f "$garde" "$f" 2>/dev/null
+    fi
+
+    git add -- "$f" 2>/dev/null || true
+    [ -f "$garde" ] && git add -- "$garde" 2>/dev/null || true
+    CONFLITS="$CONFLITS
+  $f
+      ta version est gardée dans : $garde"
+  done <<< "$fichiers"
+
+  git add -A 2>/dev/null
+  gitc commit -m "fusion : les deux versions conservées" --quiet 2>/dev/null || true
+  return 0
+}
+
+essai=0
+while [ "$essai" -lt "$MAX_ESSAIS" ]; do
+  essai=$((essai+1))
+
+  if ! recuperer; then
+    DISTANT_OK=0
+    break
+  fi
+
+  if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    a_envoyer=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  else
+    a_envoyer=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+  fi
+
+  if [ "$a_envoyer" -gt 0 ] 2>/dev/null; then
+    BRANCHE=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+    if $LIMITE git push -u origin "$BRANCHE" --quiet 2>/dev/null; then
+      ENVOYEES=$((ENVOYEES + a_envoyer))
+      break
+    else
+      [ "$essai" -ge "$MAX_ESSAIS" ] && { DISTANT_OK=0; break; }
+      continue
+    fi
+  else
+    break
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 4. Dire ce qui s'est passé
+# ---------------------------------------------------------------------------
+if [ "$DISTANT_OK" = "0" ]; then
+  # En mode --auto, on ne refait AUCUN appel réseau supplémentaire : on rend la main.
+  [ "$AUTO" = "1" ] && exit 0
+
+  erreur=$($LIMITE git ls-remote --quiet origin 2>&1 >/dev/null || true)
+  case "$erreur" in
+    *"Authentication failed"*|*"Invalid username or token"*|*"could not read Username"*|*"Permission denied"*)
+      dire "cerveau : GitHub refuse la connexion — le jeton a expiré."
+      dire "  Tout est enregistré sur cet ordinateur, rien n'est perdu."
+      dire "  Pour réparer :  gh auth login"
+      ;;
+    *"Could not resolve host"*|*"unable to access"*|*"Connection timed out"*|*"Network is unreachable"*)
+      dire "cerveau : pas de réseau. Tout est enregistré ici, ça partira au prochain essai."
+      ;;
+    *)
+      dire "cerveau : GitHub n'a pas répondu. Tout est enregistré ici, ça repartira plus tard."
+      ;;
+  esac
+  exit 0
+fi
+
+date +%s > "$HORODATAGE" 2>/dev/null || true
+
+if [ -n "$CONFLITS" ]; then
+  prevenir "cerveau : deux ordinateurs ont modifié la même note."
+  printf '%s\n' "$CONFLITS"
+  prevenir "Rien n'est perdu. Le chemin normal a la version de l'autre ordinateur,"
+  prevenir "ta version est à côté sous le nom en .conflit-…"
+  [ "$ENVOYEES" -gt 0 ] && dire "  $ENVOYEES note(s) envoyée(s)."
+  exit 0
+fi
+
+if [ "$ENVOYEES" = "0" ] && [ "$RECUPEREES" = "0" ]; then
+  [ "$AUTO" = "1" ] && exit 0
+  echo "cerveau : à jour."
+else
+  message="cerveau : "
+  [ "$ENVOYEES" -gt 0 ] && message="$message$ENVOYEES envoyée(s)"
+  [ "$ENVOYEES" -gt 0 ] && [ "$RECUPEREES" -gt 0 ] && message="$message, "
+  [ "$RECUPEREES" -gt 0 ] && message="$message$RECUPEREES récupérée(s)"
+  echo "$message."
+fi
