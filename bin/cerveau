@@ -3,20 +3,31 @@
 #
 #   cerveau            envoie ce qui attend, récupère ce qui est neuf
 #   cerveau --etat     montre seulement où on en est, sans rien toucher
-#   cerveau --importer fait digérer par Claude (Sonnet, effort bas) un lot
-#                      d'anciennes notes en attente dans .a-importer/
+#   cerveau --importer fait digérer par Claude (Sonnet, effort bas) TOUS les
+#                      lots d'anciennes notes en attente dans .a-importer/,
+#                      l'un après l'autre, et affiche ce qui a été retiré
 #   cerveau --auto     pour le démarrage de session : ne fait rien si la dernière
-#                      synchro a moins de 4 heures, et plafonne le réseau à 5 s.
+#                      synchro a moins de 4 heures (même si elle a échoué), et
+#                      borne tout son travail (fetch + push) à 9 s pour rester
+#                      sous le délai du hook SessionStart. Ce qui reste à faire
+#                      sera fait à la prochaine synchro.
 #
 # Principe : rien ne se perd. Si deux ordinateurs ont touché la même note, la
 # version locale est gardée sous un autre nom (.conflit-<machine>-…) au lieu
 # d'être écrasée, et le chemin normal reçoit la version de l'autre ordinateur.
 #
-# Ne demande jamais de mot de passe : git utilise gh ou la clé SSH configurée.
+# Ne demande jamais de mot de passe : git utilise gh ou la clé SSH configurée,
+# et toute invite d'identifiants est désactivée (échec clair au lieu d'attendre).
 
 set -uo pipefail
 
+# Aucune commande git ne doit pouvoir ouvrir une invite : sous « curl | bash »,
+# git demande les identifiants sur /dev/tty, pas sur stdin, et l'installation
+# resterait bloquée sans message. Un échec d'authentification doit être vu.
 export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS="/bin/true"
+export SSH_ASKPASS="${SSH_ASKPASS:-/bin/true}"
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}"
 
 # ---------------------------------------------------------------------------
 # Retrouver la racine du cerveau
@@ -126,6 +137,159 @@ extraire_distant() {
 }
 
 # ---------------------------------------------------------------------------
+# Un seul cerveau à la fois (deux sessions peuvent lancer --auto ensemble).
+#
+# Le verrou est un dossier (mkdir est atomique) qui contient le PID de son
+# propriétaire et l'heure à laquelle il l'a posé. Un PID seul ne suffit pas :
+# le noyau le recycle après un kill -9, et « kill -0 » réussit alors pour un
+# processus sans rapport (systemd-resolved, un onglet du navigateur…), ce qui
+# bloquerait la synchro pour toujours. On vérifie donc deux choses : le
+# processus est bien un « cerveau », et le verrou n'est pas plus vieux que la
+# plus longue durée possible d'un travail (import compris).
+# Quand flock existe, il sérialise en plus les processus ; le dossier reste la
+# trace visible et le repli quand flock n'est pas disponible.
+# ---------------------------------------------------------------------------
+VERROU=".git/cerveau.lock"
+VERROU_FLOCK=".git/cerveau.flock"
+VERROU_PRIS=0
+VERROU_FLOCK_PRIS=0
+# Un import est borné à 900 s (timeout de la session Claude) : au-delà de
+# 1000 s, un verrou ou un marqueur ne peut plus être un travail en cours.
+DUREE_MAX_TRAVAIL=1000
+
+mtime_dossier() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$maintenant"
+}
+
+# age_marqueur : ancienneté en secondes du fichier $1, lue d'abord sur sa
+# deuxième ligne (heure posée avec le PID), sinon sur sa date de modification.
+# Affiche un nombre ; ne sort jamais en erreur.
+age_marqueur() {
+  local horo age
+  horo=$(sed -n '2p' "$1" 2>/dev/null | tr -d ' \r\n')
+  case "$horo" in ''|*[!0-9]*) horo="" ;; esac
+  if [ -n "$horo" ]; then
+    age=$(( $(date +%s) - horo ))
+  else
+    age=$(( $(date +%s) - $(mtime_dossier "$1") ))
+  fi
+  [ "$age" -lt 0 ] && age=0
+  printf '%s\n' "$age"
+}
+
+# pid_est_cerveau : 0 si le processus <pid> est bien un « cerveau ».
+# Un PID vivant ne prouve rien : le noyau le recycle. On lit la ligne de
+# commande du processus (/proc sur Linux, ps ailleurs) et on y cherche
+# « cerveau ». Si on ne peut pas la lire, on renvoie 1 : le verrou sera
+# examiné par sa date, jamais déclaré vivant sur la seule foi du PID.
+pid_est_cerveau() {
+  local pid="$1" ligne=""
+  [ -n "$pid" ] || return 1
+  if [ -r "/proc/$pid/cmdline" ]; then
+    ligne=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  fi
+  if [ -z "$ligne" ]; then
+    ligne=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  fi
+  case "$ligne" in
+    *cerveau*) return 0 ;;
+  esac
+  return 1
+}
+
+# verrou_est_perime : 0 si le verrou est périmé (propriétaire mort, PID
+# recyclé par un autre programme, ou verrou trop vieux pour être vivant)
+verrou_est_perime() {
+  local pid age
+  pid=$(sed -n '1p' "$VERROU/pid" 2>/dev/null | tr -d ' \r\n')
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_est_cerveau "$pid"; then
+    age=$(age_marqueur "$VERROU/pid")
+    # Un vrai cerveau ne travaille pas plus de DUREE_MAX_TRAVAIL secondes :
+    # au-delà, c'est un reste (ou un PID recyclé par chance).
+    [ "$age" -gt "$DUREE_MAX_TRAVAIL" ] && return 0
+    return 1        # le propriétaire vit : verrou valable
+  fi
+  if [ -z "$pid" ]; then
+    # Verrou d'une version précédente, sans PID : on ne le casse pas tout de
+    # suite, au cas où le processus serait entre mkdir et l'écriture du PID.
+    age=$(( maintenant - $(mtime_dossier "$VERROU") ))
+    [ "$age" -gt 600 ] || return 1
+  fi
+  return 0
+}
+
+# prendre_verrou : 0 si on a le verrou, 1 si un autre cerveau travaille.
+prendre_verrou() {
+  if command -v flock >/dev/null 2>&1; then
+    if ! exec 9>"$VERROU_FLOCK"; then
+      echo "cerveau : impossible de créer le fichier de verrou ($VERROU_FLOCK)."
+      return 1
+    fi
+    if ! flock -n 9; then
+      exec 9>&-
+      return 1
+    fi
+    VERROU_FLOCK_PRIS=1
+  fi
+
+  if [ -d "$VERROU" ]; then
+    if ! verrou_est_perime; then
+      liberer_verrou
+      return 1
+    fi
+    # Propriétaire mort : on reprend le verrou (on sait qu'on est seul grâce à flock).
+    rm -rf "$VERROU" 2>/dev/null || true
+  fi
+
+  if mkdir "$VERROU" 2>/dev/null; then
+    # Deux lignes : le PID, puis l'heure de pose. L'heure permet de déclarer
+    # périmé un verrou dont le PID aurait été recyclé par un autre programme.
+    printf '%s\n%s\n' "$$" "$maintenant" > "$VERROU/pid" 2>/dev/null || true
+    VERROU_PRIS=1
+    return 0
+  fi
+  liberer_verrou
+  return 1
+}
+
+# marqueur_import_perime : 0 si .a-importer/.en-cours est abandonné.
+# Le marqueur porte le PID de l'import qui l'a posé et l'heure de pose : un
+# kill -9, une coupure de courant ou un OOM killer ne laisse pas le temps au
+# trap de le retirer. Un marqueur dont le propriétaire est mort ne doit pas
+# bloquer les imports suivants. Et un PID vivant ne suffit pas (le noyau le
+# recycle) : on vérifie que le processus est bien un « cerveau », et on
+# déclare périmé tout marqueur plus vieux que la durée maximale d'un import.
+# Un marqueur vide (version précédente, ou écriture coupée) est périmé lui
+# aussi : aucun processus ne peut plus se réclamer de lui.
+marqueur_import_perime() {
+  local marqueur="$1" pid age
+  pid=$(sed -n '1p' "$marqueur" 2>/dev/null | tr -d ' \r\n')
+  if [ -z "$pid" ]; then
+    return 0
+  fi
+  if kill -0 "$pid" 2>/dev/null && pid_est_cerveau "$pid"; then
+    age=$(age_marqueur "$marqueur")
+    # Au-delà de la durée maximale d'un import, ce n'est plus un import en
+    # cours : le marqueur est un reste, même si le PID vit encore.
+    [ "$age" -gt "$DUREE_MAX_TRAVAIL" ] && return 0
+    return 1        # le propriétaire vit : import réellement en cours
+  fi
+  return 0
+}
+
+# liberer_verrou : ne retire QUE le verrou qu'on a posé soi-même.
+liberer_verrou() {
+  if [ "$VERROU_PRIS" = "1" ]; then
+    rm -rf "$VERROU" 2>/dev/null || true
+    VERROU_PRIS=0
+  fi
+  if [ "$VERROU_FLOCK_PRIS" = "1" ]; then
+    exec 9>&- 2>/dev/null || true
+    VERROU_FLOCK_PRIS=0
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # --etat : rien à faire, juste regarder
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--etat" ]; then
@@ -144,6 +308,21 @@ if [ "${1:-}" = "--etat" ]; then
     echo "Jamais synchronisé."
   fi
   echo "Total de notes : $(find notes -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+
+  # Constat 10 : un conflit réglé par --auto dépose une copie .conflit-… que
+  # personne ne voit (la sortie du hook est avalée). On la signale ici tant
+  # qu'elle existe, et on explique quoi en faire.
+  CONFLITS_A_LIRE=$(find notes -type f -name '*.conflit-*' 2>/dev/null | sort)
+  if [ -n "$CONFLITS_A_LIRE" ]; then
+    echo
+    echo "Conflits déjà réglés, à relire :"
+    printf '%s\n' "$CONFLITS_A_LIRE" | while IFS= read -r f; do
+      [ -n "$f" ] && echo "  - $f"
+    done
+    echo "  L'autre version est au chemin normal. Recopie ce qui compte depuis ces"
+    echo "  fichiers, puis supprime-les : ils disparaîtront de cette liste."
+  fi
+
   if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ]; then
     echo "Attention, une fusion est restée en cours — lance « cerveau » pour la régler."
   fi
@@ -151,8 +330,9 @@ if [ "${1:-}" = "--etat" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# --importer : faire digérer par Claude une fois les anciennes notes
-#              déposées par l'installateur dans .a-importer/ (un lot à la fois)
+# --importer : faire digérer par Claude les anciennes notes déposées par
+#              l'installateur dans .a-importer/ (tous les lots en attente,
+#              l'un après l'autre, dans un seul appel)
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--importer" ]; then
   SAS="$CERVEAU/.a-importer"
@@ -161,19 +341,59 @@ if [ "${1:-}" = "--importer" ]; then
     exit 0
   fi
 
-  LOT=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | sort | head -1)
-  if [ -z "$LOT" ]; then
+  compter_lots() {
+    find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' '
+  }
+
+  if [ "$(compter_lots)" = "0" ]; then
     rmdir "$SAS" 2>/dev/null || true
     echo "cerveau : tout a été importé, rien ne reste dans .a-importer/."
     exit 0
   fi
 
+  # Le marqueur porte le PID de l'import qui l'a posé et l'heure de pose. Un
+  # kill -9, une coupure de courant ou un OOM killer ne laisse pas le temps au
+  # trap de le retirer : sans cette vérification, ce seul fichier refusait tout
+  # import futur. On ne le déclare périmé que si le processus est mort, s'il
+  # n'est pas un « cerveau » (PID recyclé), ou si le marqueur est plus vieux
+  # que la durée maximale d'un import (voir marqueur_import_perime).
   if [ -f "$SAS/.en-cours" ]; then
-    echo "cerveau : une importation est déjà en cours."
+    if ! marqueur_import_perime "$SAS/.en-cours"; then
+      echo "cerveau : une importation est déjà en cours."
+      exit 0
+    fi
+    echo "cerveau : le marqueur d'un import interrompu traînait — je le retire et je reprends."
+    rm -f "$SAS/.en-cours" 2>/dev/null || true
+  fi
+
+  # Constat 12 : l'import prend le MÊME verrou que la synchronisation. Sans ça,
+  # une session ouverte pendant l'import commitait et poussait des notes à moitié
+  # écrites vers les autres ordinateurs. Le verrou couvre TOUS les lots de
+  # l'appel, pas seulement le premier.
+  if ! prendre_verrou; then
+    echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
     exit 0
   fi
-  : > "$SAS/.en-cours"
-  trap 'rm -f "$SAS/.en-cours" 2>/dev/null' EXIT INT TERM
+  printf '%s\n%s\n' "$$" "$maintenant" > "$SAS/.en-cours" 2>/dev/null || true
+
+  # La sortie de chaque session est gardée pour en extraire la section
+  # « Retiré : » (ce que le modèle n'a pas recopié). Le fichier vit dans le
+  # sas, ignoré par git, et il est retiré en sortant.
+  SORTIE_IMPORT="$SAS/.sortie-import.$$"
+  if ! : > "$SORTIE_IMPORT" 2>/dev/null; then
+    SORTIE_IMPORT=/dev/null
+  fi
+  # nettoyer_import : le marqueur d'import, la sortie gardée, puis le verrou.
+  # Appelée par le trap et à la fin normale.
+  nettoyer_import() {
+    rm -f "$SAS/.en-cours" 2>/dev/null || true
+    case "${SORTIE_IMPORT:-}" in
+      ""|/dev/null) : ;;
+      *) rm -f "$SORTIE_IMPORT" 2>/dev/null || true ;;
+    esac
+    liberer_verrou
+  }
+  trap 'nettoyer_import' EXIT INT TERM
 
   if ! command -v claude >/dev/null 2>&1; then
     echo "cerveau : la commande « claude » est introuvable, impossible d'importer."
@@ -181,15 +401,94 @@ if [ "${1:-}" = "--importer" ]; then
     exit 1
   fi
 
-  RESTANTS=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
-  echo "cerveau : importation de $(basename "$LOT") (1 lot sur $RESTANTS)…"
-  echo "  Claude (Sonnet, effort bas) lit et réécrit ces notes aux règles du cerveau."
+  # Empreinte du travail réel : ce que Claude écrit dans notes/ et me.md. Elle
+  # sert à ne plus croire un import réussi sur la seule disparition du lot.
+  empreinte_notes() {
+    ( cd "$CERVEAU" && find notes me.md -type f -name '*.md' -exec cksum {} + 2>/dev/null | sort )
+  }
 
-  # La commande est ensuite proposée à Claude par son nom court ; on s'assure qu'il
-  # est trouvable même si ~/.local/bin n'est pas dans le PATH de la session.
-  export PATH="$HOME/.local/bin:$PATH"
+  # a_un_retire <fichier> : 0 si la sortie du modèle contient une section
+  # « Retiré : » (celle par laquelle il termine, qui liste ce qu'il n'a pas
+  # recopié). Le prompt la lui demande ; un modèle qui ne la connaît pas (le
+  # faux claude du banc, un modèle plus ancien) n'en écrit pas, et cerveau doit
+  # le tolérer en le disant, pas en laissant croire que rien n'a été retiré.
+  a_un_retire() {
+    [ -n "$1" ] && [ -f "$1" ] || return 1
+    grep -qE '^[[:space:]#*_-]*Retiré[[:space:]]*:' "$1" 2>/dev/null
+  }
 
-  PROMPT="Tu vas assimiler un lot d'anciennes notes dans ma mémoire permanente.
+  # Modèle d'import : Sonnet (bon rapport qualité/coût pour du classement), effort bas.
+  # Surchargeable : CERVEAU_MODELE_IMPORT="auto:cc-flash" cerveau --importer
+  MODELE_IMPORT="${CERVEAU_MODELE_IMPORT:-sonnet}"
+  EFFORT_IMPORT="${CERVEAU_EFFORT_IMPORT:-low}"
+
+  # lancer_import <avec|sans> : lance la session, affiche sa sortie et la garde
+  # dans $SORTIE_IMPORT. Sous pipefail, le code de retour est celui de la
+  # session, pas celui de tee.
+  lancer_import() {
+    if [ "$1" = "avec" ]; then
+      # 9>&- : la session Claude ne doit PAS hériter du verrou de synchro. Un
+      # « timeout » place son enfant dans un autre groupe de processus ; si
+      # l'import est tué (kill -9, fermeture du terminal), ce descendant survit
+      # quelques secondes et garderait le verrou, bloquant toute relance.
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 900 claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
+          --permission-mode acceptEdits --add-dir "$CERVEAU" 9>&- 2>&1 | tee "$SORTIE_IMPORT"
+      else
+        claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
+          --permission-mode acceptEdits --add-dir "$CERVEAU" 9>&- 2>&1 | tee "$SORTIE_IMPORT"
+      fi
+    else
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 900 claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU" 9>&- 2>&1 | tee "$SORTIE_IMPORT"
+      else
+        claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU" 9>&- 2>&1 | tee "$SORTIE_IMPORT"
+      fi
+    fi
+  }
+
+  # Tous les lots en attente sont traités d'affilée : un utilisateur qui lance
+  # la commande une seule fois ne laisse pas la moitié de ses anciennes notes
+  # dans le sas. Chaque lot garde ses garde-fous (archive vérifiée, travail réel
+  # constaté) ; si l'un échoue, on s'arrête là et les suivants restent en sas.
+  NBLOTS_TOTAL=$(compter_lots)
+  IMPORTES=0
+
+  while :; do
+    LOT=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | sort | head -1)
+    [ -n "$LOT" ] || break
+
+    echo "cerveau : importation de $(basename "$LOT") ($((IMPORTES + 1)) lot sur $NBLOTS_TOTAL)…"
+    echo "  Claude (Sonnet, effort bas) lit et réécrit ces notes aux règles du cerveau."
+
+    AVANT=$(empreinte_notes)
+
+    # Archive de sécurité, copiée AVANT que Claude ne supprime le lot : si la
+    # session s'arrête sans rien écrire, on remet le lot en place depuis là.
+    # La copie est VÉRIFIÉE : sur un disque plein ou un dossier en lecture seule
+    # elle peut échouer, et le lot serait alors le seul exemplaire de ces notes.
+    # Dans ce cas on ne lance pas Claude du tout : rien n'est touché.
+    ARCHIVE="$SAS/traites/$(basename "$LOT")"
+    if ! mkdir -p "$SAS/traites" 2>/dev/null; then
+      echo "cerveau : impossible de créer le dossier d'archive ($SAS/traites)."
+      echo "  Je n'ai touché à rien : le lot est intact dans $SAS."
+      echo "  Souvent : un disque plein, ou un dossier en lecture seule."
+      echo "  Libère de la place, puis relance  cerveau --importer"
+      exit 1
+    fi
+    if ! cp -p "$LOT" "$ARCHIVE" 2>/dev/null || [ ! -s "$ARCHIVE" ]; then
+      echo "cerveau : impossible d'archiver le lot ($ARCHIVE)."
+      echo "  Je ne touche à rien et je ne lance pas l'import : le lot est intact"
+      echo "  dans $SAS. Souvent : un disque plein, ou un dossier en lecture seule."
+      echo "  Libère de la place, puis relance  cerveau --importer"
+      exit 1
+    fi
+
+    # La commande est ensuite proposée à Claude par son nom court ; on s'assure qu'il
+    # est trouvable même si ~/.local/bin n'est pas dans le PATH de la session.
+    export PATH="$HOME/.local/bin:$PATH"
+
+    PROMPT="Tu vas assimiler un lot d'anciennes notes dans ma mémoire permanente.
 
 Le fichier à lire est : $LOT
 Il contient des notes que Claude Code avait écrites avant l'installation du cerveau, regroupées par projet source, avec le nom de l'ordinateur d'origine.
@@ -203,130 +502,219 @@ Ce que tu dois faire, en une seule passe :
 6. Extrais en priorité les erreurs déjà payées, les endroits, les décisions et leur pourquoi, les contraintes et les chiffres de référence. Rien de chronologique.
 7. Complète ./me.md (qui je suis, comment je travaille) et ./notes/ordinateurs.md (la machine d'origine et ce qu'elle a de particulier) avec ce que le lot t'apprend.
 8. Mets à jour ./notes/MEMORY.md : une ligne par note, avec sa description.
-9. Quand c'est fini, supprime le fichier du lot : $LOT
+9. Ne recopie JAMAIS la VALEUR d'un secret : mot de passe, code d'accès, clé d'API, jeton ou code PIN. Ce dépôt part sur GitHub. Écris à la place une mention utile, par exemple : « Un mot de passe pour la box existait dans les anciennes notes ; il n'a pas été recopié ici. » Rien d'autre ne doit être supprimé sans être signalé à l'étape 10.
+10. Termine ta sortie par une section « Retiré : » qui liste tout ce que tu n'as pas recopié (un élément par ligne, avec l'endroit et la raison) ; si tu n'as rien retiré, écris « Retiré : rien ».
+11. Quand c'est fini, supprime le fichier du lot : $LOT
 
 Ne me pose aucune question : fais au mieux avec ce que le lot contient. Ne touche à rien d'autre dans le dossier."
 
-  # Modèle d'import : Sonnet (bon rapport qualité/coût pour du classement), effort bas.
-  # Surchargeable : CERVEAU_MODELE_IMPORT="auto:cc-flash" cerveau --importer
-  MODELE_IMPORT="${CERVEAU_MODELE_IMPORT:-sonnet}"
-  EFFORT_IMPORT="${CERVEAU_EFFORT_IMPORT:-low}"
-
-  lancer_import() {
-    # $1 = "avec" (modèle/effort explicites) ou "sans"
-    if [ "$1" = "avec" ]; then
-      if command -v timeout >/dev/null 2>&1; then
-        timeout 900 claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
-          --permission-mode acceptEdits --add-dir "$CERVEAU"
-      else
-        claude -p "$PROMPT" --model "$MODELE_IMPORT" --effort "$EFFORT_IMPORT" \
-          --permission-mode acceptEdits --add-dir "$CERVEAU"
-      fi
-    else
-      if command -v timeout >/dev/null 2>&1; then
-        timeout 900 claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU"
-      else
-        claude -p "$PROMPT" --permission-mode acceptEdits --add-dir "$CERVEAU"
-      fi
-    fi
-  }
-
-  lancer_import avec
-  CODE_IMPORT=$?
-  # Si le modèle « sonnet » n'existe pas sur cette installation (route proxy, autre
-  # abonnement), on retente une fois avec le modèle par défaut de la session.
-  if [ "$CODE_IMPORT" -ne 0 ] && [ -f "$LOT" ]; then
-    echo "  (le modèle « $MODELE_IMPORT » n'est pas disponible ici — je réessaie avec le modèle par défaut)"
-    lancer_import sans
+    lancer_import avec
     CODE_IMPORT=$?
-  fi
-
-  # Le lot doit avoir été supprimé par Claude. S'il reste, c'est que la session
-  # n'a rien fait (Claude non connecté, coupure, quota) : on ne dit PAS « importé ».
-  RESTANTS=$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
-  rm -f "$SAS/.en-cours" 2>/dev/null
-
-  if [ -f "$LOT" ]; then
-    echo
-    echo "cerveau : l'importation n'a PAS été faite."
-    echo "  La session Claude n'a rien écrit : elle s'est arrêtée avant (souvent parce"
-    echo "  que Claude Code n'est pas connecté sur ce poste, ou par manque de quota)."
-    if [ "${CODE_IMPORT:-0}" -ne 0 ]; then
-      echo "  Code de retour de la session : $CODE_IMPORT"
+    # Si le modèle « sonnet » n'existe pas sur cette installation (route proxy, autre
+    # abonnement), on retente une fois avec le modèle par défaut de la session.
+    if [ "$CODE_IMPORT" -ne 0 ] && [ -f "$LOT" ]; then
+      echo "  (le modèle « $MODELE_IMPORT » n'est pas disponible ici — je réessaie avec le modèle par défaut)"
+      lancer_import sans
+      CODE_IMPORT=$?
     fi
-    echo "  Le lot est intact dans $SAS — rien n'est perdu."
-    echo "  À faire : vérifie avec  claude  que tu es bien connecté, puis relance"
-    echo "            cerveau --importer"
-    exit 1
-  fi
 
-  # Le lot a bien été consommé : on note ce qui a été traité pour ne pas le refaire.
-  if [ ! -d "$SAS" ] || [ -z "$(find "$SAS" -maxdepth 1 -name 'lot-*.md' -type f 2>/dev/null)" ]; then
-    mkdir -p "$SAS/traites" 2>/dev/null || true
-  fi
+    # Le lot doit avoir été supprimé par Claude ET du vrai travail doit avoir été
+    # écrit. Sinon on ne dit PAS « importé » : on remet le lot en place depuis
+    # l'archive, pour qu'une relance puisse reprendre sans rien avoir perdu. Les
+    # lots suivants, eux, n'ont pas été touchés et restent dans le sas.
+    APRES=$(empreinte_notes)
 
-  echo "cerveau : lot importé."
-  if [ "$RESTANTS" -gt 0 ] 2>/dev/null; then
-    echo "  Il reste $RESTANTS lot(s). Lance « cerveau --importer » quand tu veux la suite."
-  fi
+    if [ ! -f "$LOT" ] && [ "$APRES" = "$AVANT" ]; then
+      # Le lot a disparu mais aucune note n'a été écrite : faux succès.
+      # On ne dit « remis en place » qu'après l'avoir VÉRIFIÉ : une copie peut
+      # échouer elle aussi (disque plein, lecture seule).
+      if [ -f "$ARCHIVE" ]; then
+        cp -p "$ARCHIVE" "$LOT" 2>/dev/null || true
+      fi
+      echo
+      echo "cerveau : l'importation n'a PAS été faite."
+      echo "  Le lot a disparu, mais aucune note n'a été écrite dans notes/."
+      if [ -f "$LOT" ]; then
+        echo "  Je l'ai remis en place depuis l'archive — rien n'est perdu."
+      elif [ -f "$ARCHIVE" ]; then
+        echo "  Je n'ai PAS pu le remettre en place, mais sa copie de secours est intacte :"
+        echo "    $ARCHIVE"
+        echo "  Rien n'est perdu : recopie-la à la main dans $SAS sous son nom d'origine,"
+        echo "  puis relance  cerveau --importer"
+      else
+        echo "  ATTENTION : ni le lot ni son archive ne sont là. Vérifie l'espace disque"
+        echo "  et les droits de $SAS avant de relancer."
+      fi
+      if [ "${CODE_IMPORT:-0}" -ne 0 ]; then
+        echo "  Code de retour de la session : $CODE_IMPORT"
+      fi
+      echo "  À faire : vérifie avec  claude  que tu es bien connecté, puis relance"
+      echo "            cerveau --importer"
+      exit 1
+    fi
 
-  # Puis on synchronise normalement (commit + push de ce que Claude vient d'écrire).
-  # On sauvegarde d'abord les arguments : sans ça, `exec "$0"` relançait la commande
-  # sans argument et l'utilisateur ne voyait qu'une synchro muette.
+    if [ -f "$LOT" ]; then
+      echo
+      echo "cerveau : l'importation n'a PAS été faite."
+      echo "  La session Claude n'a rien écrit : elle s'est arrêtée avant (souvent parce"
+      echo "  que Claude Code n'est pas connecté sur ce poste, ou par manque de quota)."
+      if [ "${CODE_IMPORT:-0}" -ne 0 ]; then
+        echo "  Code de retour de la session : $CODE_IMPORT"
+      fi
+      echo "  Le lot est intact dans $SAS — rien n'est perdu."
+      echo "  À faire : vérifie avec  claude  que tu es bien connecté, puis relance"
+      echo "            cerveau --importer"
+      exit 1
+    fi
+
+    # Le travail a réellement été fait : le lot est déjà archivé dans traites/.
+    # Ses empreintes ne rejoignent .vus qu'ICI, après validation : une relance de
+    # l'installateur ne recréera pas ces fragments, et un lot perdu sans travail
+    # n'aura jamais été marqué comme importé.
+    EMPREINTES=$(sed -n '/^# empreintes : /{s/^# empreintes : //;p;q;}' "$ARCHIVE" 2>/dev/null)
+    if [ -z "$EMPREINTES" ]; then
+      # Lot écrit par un installateur d'avant l'en-tête d'empreintes (ou dont
+      # l'en-tête a été modifié à la main). Le travail est fait, mais on ne peut
+      # pas marquer ses fragments : une relance de l'installateur en recréerait
+      # un lot identique. On le dit, au lieu d'annoncer « lot importé ».
+      echo "cerveau : le lot a bien été traité, mais il n'a pas d'en-tête « # empreintes : »"
+      echo "  (lot écrit par une version antérieure de l'installateur)."
+      echo "  Ses fragments ne peuvent donc pas être marqués comme déjà importés :"
+      echo "  une prochaine installation peut recréer un lot avec les mêmes notes."
+      echo "  Le lot reste archivé ici pour vérification :"
+      echo "    $ARCHIVE"
+      echo "  Si un lot identique réapparaît, relance « cerveau --importer » pour"
+      echo "  l'assimiler, puis supprime le doublon dans notes/ s'il y en a un."
+    else
+      for h in $EMPREINTES; do
+        grep -qxF "$h" "$SAS/.vus" 2>/dev/null || printf '%s\n' "$h" >> "$SAS/.vus"
+      done
+      echo "cerveau : lot importé."
+    fi
+
+    # Ce que le modèle n'a pas recopié est dit à l'utilisateur : le prompt lui
+    # demande de terminer par une section « Retiré : », et sa sortie est
+    # transmise telle quelle juste au-dessus. S'il ne l'a pas donnée (faux
+    # claude du banc, modèle plus ancien), on l'écrit au lieu de laisser croire
+    # que rien n'a été retiré.
+    if ! a_un_retire "$SORTIE_IMPORT"; then
+      echo
+      echo "Retiré : non précisé"
+    fi
+
+    IMPORTES=$((IMPORTES + 1))
+  done
+
+  echo "cerveau : $IMPORTES lot(s) importé(s)."
+
+  # Puis on synchronise normalement (commit + push de ce que Claude vient d'écrire
+  # pour tous les lots). On retire le marqueur et on libère le verrou AVANT de
+  # relancer la commande : sinon la synchro le trouverait tenu par elle-même.
+  nettoyer_import
+  trap - EXIT INT TERM
   set --
   exec "$0"
 fi
 
 # ---------------------------------------------------------------------------
-# --auto : au démarrage de session (plafond 5 s, silence si < 4 h)
+# --auto : au démarrage de session (silence si < 4 h)
 # ---------------------------------------------------------------------------
 AUTO=0
-DUREE_TIMEOUT=25
+# En manuel, on laisse largement le temps à une connexion lente (le `timeout`
+# s'applique PAR commande réseau, pas au total).
+DUREE_TIMEOUT=60
+# Budget TOTAL du mode --auto, fetch et push compris : le hook SessionStart tue
+# la commande au bout de 10 s (timeout posé dans settings.json). Un plafond par
+# commande ne suffit pas : un fetch de 7 s suivi d'un push de 7 s ferait 14 s et
+# serait tué au milieu de l'envoi. Le reste du travail se fera à la prochaine
+# synchro (ou à la main, qui elle n'est pas pressée).
+BUDGET_AUTO=9
+DEBUT_AUTO=$(date +%s)
 if [ "${1:-}" = "--auto" ]; then
   AUTO=1
-  DUREE_TIMEOUT=5
   ts=$(derniere_synchro)
   if [ "$ts" -gt 0 ] 2>/dev/null && [ $(( maintenant - ts )) -lt "$DELAI_AUTO" ]; then
     exit 0          # moins de 4 h : on ne fait rien, et on ne dit rien
   fi
 fi
 
+# L'outil de délai, s'il existe (absent de macOS sans coreutils).
+TIMEOUT_CMD=""
 if command -v timeout >/dev/null 2>&1; then
-  LIMITE="timeout $DUREE_TIMEOUT"
+  TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
-  LIMITE="gtimeout $DUREE_TIMEOUT"
+  TIMEOUT_CMD="gtimeout"
+fi
+
+# LIMITE : le délai appliqué à une commande locale (fusion), pour ne pas
+# accrocher indéfiniment.
+if [ -n "$TIMEOUT_CMD" ]; then
+  LIMITE="$TIMEOUT_CMD $DUREE_TIMEOUT"
 else
   LIMITE=""
 fi
 
+# secondes_restantes : temps qu'il reste dans le budget du mode --auto.
+secondes_restantes() {
+  local reste
+  reste=$(( BUDGET_AUTO - ( $(date +%s) - DEBUT_AUTO ) ))
+  [ "$reste" -lt 0 ] && reste=0
+  printf '%s\n' "$reste"
+}
+
+# reseau <commande…> : lance une commande réseau avec le délai qui convient.
+# En --auto, c'est le budget total restant ; en manuel, 60 s par commande.
+# Sans outil de délai (macOS sans coreutils), on borne nous-mêmes : la commande
+# passe en arrière-plan et on la tue au bout du délai, avec le code 124 (le
+# même que « timeout ») pour que l'appelant distingue une lenteur d'une panne.
+reseau() {
+  local reste pid debut
+  if [ "$AUTO" = "1" ]; then
+    reste=$(secondes_restantes)
+    [ "$reste" -le 0 ] && return 124
+  else
+    reste=$DUREE_TIMEOUT
+  fi
+
+  if [ -n "$TIMEOUT_CMD" ]; then
+    $TIMEOUT_CMD "$reste" "$@"
+    return $?
+  fi
+
+  "$@" &
+  pid=$!
+  debut=$(date +%s)
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $(( $(date +%s) - debut )) -ge "$reste" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.2
+  done
+  wait "$pid"
+  return $?
+}
+
 dire()     { [ "$AUTO" = "1" ] || echo "$@"; }
 prevenir() { echo "$@"; }      # un conflit se signale toujours
 
-# ---------------------------------------------------------------------------
-# Un seul cerveau à la fois (deux sessions peuvent lancer --auto ensemble)
-# ---------------------------------------------------------------------------
-VERROU=".git/cerveau.lock"
-
-mtime_dossier() {
-  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$maintenant"
-}
-
-if ! mkdir "$VERROU" 2>/dev/null; then
-  age=$(( maintenant - $(mtime_dossier "$VERROU") ))
-  if [ "$age" -gt 60 ]; then
-    rmdir "$VERROU" 2>/dev/null || true
-    mkdir "$VERROU" 2>/dev/null || {
-      [ "$AUTO" = "1" ] && exit 0
-      echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
-      exit 0
-    }
-  else
-    [ "$AUTO" = "1" ] && exit 0
-    echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
-    exit 0
-  fi
+# Un import laissé en plan par un kill -9 n'est pas une raison de refuser la
+# synchro : si son marqueur est périmé, on le retire (le lot, lui, reste dans le
+# sas et sera traité par le prochain « cerveau --importer »).
+if [ -f "$CERVEAU/.a-importer/.en-cours" ] \
+   && marqueur_import_perime "$CERVEAU/.a-importer/.en-cours"; then
+  rm -f "$CERVEAU/.a-importer/.en-cours" 2>/dev/null || true
 fi
-trap 'rmdir "$VERROU" 2>/dev/null || true' EXIT INT TERM
+
+if ! prendre_verrou; then
+  [ "$AUTO" = "1" ] && exit 0
+  echo "cerveau : une autre synchronisation est déjà en cours, réessaie dans un instant."
+  exit 0
+fi
+trap 'liberer_verrou' EXIT INT TERM
 
 # ---------------------------------------------------------------------------
 # Se remettre d'une fusion ou d'un rebase interrompu lors d'une exécution tuée
@@ -357,6 +745,17 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   gitc commit -m "notes : synchronisation du $(date '+%d/%m/%Y %H:%M')" --quiet 2>/dev/null || true
 fi
 
+# Constat 9 : un commit refusé (hook pre-commit, index.lock oublié) ne doit jamais
+# se transformer en « à jour ». Si des notes restent hors de git, on le dit.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "cerveau : tes notes sont sur cet ordinateur, mais elles n'ont PAS pu être"
+  echo "  enregistrées dans git, donc elles ne partiront pas sur GitHub."
+  echo "  Rien n'est perdu : elles sont dans $CERVEAU."
+  echo "  Souvent : un fichier .git/index.lock oublié, ou un hook pre-commit qui refuse."
+  echo "  Vérifie avec  git -C $CERVEAU status  puis relance « cerveau »."
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 2. Récupérer, puis 3. Envoyer
 # ---------------------------------------------------------------------------
@@ -365,9 +764,18 @@ CONFLITS=""
 DISTANT_OK=1
 ENVOYEES=0
 RECUPEREES=0
+ECHEC_RESEAU=0
+FUSION_REFUSEE=0
+ECHEC_FUSION=""
 
 recuperer() {
-  if $LIMITE git fetch --quiet origin 2>/dev/null; then :; else return 1; fi
+  local code_fetch
+  reseau git fetch --quiet origin 2>/dev/null
+  code_fetch=$?
+  if [ "$code_fetch" -ne 0 ]; then
+    ECHEC_RESEAU="$code_fetch"
+    return 3        # 3 = problème de réseau / d'accès au dépôt
+  fi
 
   local branche avant_head apres_head n
   branche=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -397,8 +805,12 @@ recuperer() {
   local fichiers f base garde horo_conflit
   fichiers=$(git diff --name-only --diff-filter=U 2>/dev/null)
   if [ -z "$fichiers" ]; then
+    # Fusion refusée sans aucun conflit : index.lock oublié, modifications
+    # locales qui seraient écrasées, hook pre-merge-commit… Ce n'est PAS un
+    # problème de réseau : on le dit, et on renvoie un code distinct (2).
     git merge --abort 2>/dev/null || true
-    return 1
+    ECHEC_FUSION=$(git status 2>&1 | head -20)
+    return 2
   fi
 
   horo_conflit=$(date '+%Y%m%d-%H%M%S')
@@ -443,7 +855,18 @@ recuperer() {
   done <<< "$fichiers"
 
   git add -A 2>/dev/null
-  gitc commit -m "fusion : les deux versions conservées" --quiet 2>/dev/null || true
+  if ! gitc commit -m "fusion : les deux versions conservées" --quiet 2>/dev/null; then
+    # Constat 9 : la fusion n'est pas enregistrée. Les deux textes sont sur le
+    # disque, mais on ne dit pas « tout va bien » : sans commit, la prochaine
+    # exécution annulerait la fusion.
+    if [ -f .git/MERGE_HEAD ] || [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+      echo "cerveau : les deux versions sont gardées sur le disque, mais la fusion"
+      echo "  n'a pas pu être enregistrée dans git — rien n'est parti sur GitHub."
+      echo "  Rien n'est perdu. Corrige (souvent un hook pre-commit ou un index.lock),"
+      echo "  puis relance « cerveau »."
+      exit 1
+    fi
+  fi
   return 0
 }
 
@@ -451,8 +874,13 @@ essai=0
 while [ "$essai" -lt "$MAX_ESSAIS" ]; do
   essai=$((essai+1))
 
-  if ! recuperer; then
+  recuperer
+  code_recup=$?
+  if [ "$code_recup" -ne 0 ]; then
     DISTANT_OK=0
+    if [ "$code_recup" = "2" ]; then
+      FUSION_REFUSEE=1
+    fi
     break
   fi
 
@@ -464,10 +892,13 @@ while [ "$essai" -lt "$MAX_ESSAIS" ]; do
 
   if [ "$a_envoyer" -gt 0 ] 2>/dev/null; then
     BRANCHE=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
-    if $LIMITE git push -u origin "$BRANCHE" --quiet 2>/dev/null; then
+    reseau git push -u origin "$BRANCHE" --quiet 2>/dev/null
+    code_push=$?
+    if [ "$code_push" -eq 0 ]; then
       ENVOYEES=$((ENVOYEES + a_envoyer))
       break
     else
+      ECHEC_RESEAU=$code_push
       [ "$essai" -ge "$MAX_ESSAIS" ] && { DISTANT_OK=0; break; }
       continue
     fi
@@ -480,15 +911,54 @@ done
 # 4. Dire ce qui s'est passé
 # ---------------------------------------------------------------------------
 if [ "$DISTANT_OK" = "0" ]; then
-  # En mode --auto, on ne refait AUCUN appel réseau supplémentaire : on rend la main.
-  [ "$AUTO" = "1" ] && exit 0
+  # L'échec est horodaté, même en --auto : sans ça, un portable hors réseau
+  # retentait 9 s à chaque session et répétait le même message, alors que le
+  # contrat annoncé est « rien pendant 4 h ». Le délai protège aussi les échecs.
+  date +%s > "$HORODATAGE" 2>/dev/null || true
 
-  erreur=$($LIMITE git ls-remote --quiet origin 2>&1 >/dev/null || true)
+  # Fusion refusée sans conflit (index.lock, modifications locales, hook) :
+  # ce n'est pas le réseau. On montre l'état réel de git et on ne parle pas de
+  # Wi-Fi, sinon l'utilisateur cherche une panne qui n'existe pas.
+  if [ "${FUSION_REFUSEE:-0}" = "1" ]; then
+    echo "cerveau : la fusion avec GitHub n'a pas pu se faire — ce n'est pas le réseau."
+    echo "  Tes notes sont enregistrées sur cet ordinateur, rien n'est perdu."
+    echo "  Souvent : un fichier .git/index.lock oublié, des modifications locales"
+    echo "  non enregistrées, ou un hook qui refuse la fusion."
+    if [ -n "${ECHEC_FUSION:-}" ]; then
+      echo "  État de git :"
+      printf '%s\n' "$ECHEC_FUSION" | while IFS= read -r l; do
+        [ -n "$l" ] && echo "    $l"
+      done
+    fi
+    echo "  Vérifie avec  git -C $CERVEAU status  puis relance « cerveau »."
+    exit 1
+  fi
+
+  # Code 124 = « timeout » : la commande a été coupée parce qu'elle était trop
+  # lente. Ce n'est PAS la même chose qu'un réseau absent, et le dire évite
+  # d'envoyer l'utilisateur chercher une panne qui n'existe pas.
+  if [ "$ECHEC_RESEAU" = "124" ] || [ "$ECHEC_RESEAU" = "137" ]; then
+    echo "cerveau : la connexion à GitHub est trop lente pour ce réglage de temps."
+    echo "  Tes notes sont enregistrées sur cet ordinateur, rien n'est perdu."
+    echo "  Réessaie quand le réseau va mieux, ou lance « cerveau » à la main"
+    echo "  (il laisse beaucoup plus de temps qu'une synchro automatique)."
+    exit 0
+  fi
+
+  # En mode --auto, on ne refait AUCUN appel réseau supplémentaire : on dit
+  # simplement que ça n'a pas marché (jamais « à jour »), et on rend la main.
+  if [ "$AUTO" = "1" ]; then
+    echo "cerveau : la synchronisation automatique n'a pas abouti (réseau ou GitHub)."
+    echo "  Tes notes sont enregistrées sur cet ordinateur ; « cerveau » réessaiera."
+    exit 0
+  fi
+
+  erreur=$(reseau git ls-remote --quiet origin 2>&1 >/dev/null || true)
   case "$erreur" in
-    *"Authentication failed"*|*"Invalid username or token"*|*"could not read Username"*|*"Permission denied"*)
+    *"Authentication failed"*|*"Invalid username or token"*|*"could not read Username"*|*"Permission denied"*|*"terminal prompts disabled"*)
       dire "cerveau : GitHub refuse la connexion — le jeton a expiré."
       dire "  Tout est enregistré sur cet ordinateur, rien n'est perdu."
-      dire "  Pour réparer :  gh auth login"
+      dire "  Pour réparer :  gh auth login  puis  gh auth setup-git"
       ;;
     *"Could not resolve host"*|*"unable to access"*|*"Connection timed out"*|*"Network is unreachable"*)
       dire "cerveau : pas de réseau. Tout est enregistré ici, ça partira au prochain essai."

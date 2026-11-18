@@ -129,3 +129,21 @@ le titre :
   est, comment il marche et quels pièges il contient.
 - **La transcription brute d'une session** : on garde les conclusions, les pièges et les
   décisions, pas le bavardage.
+
+---
+
+## Les secrets : jamais leur valeur
+
+Ce dépôt part sur GitHub. **La VALEUR d'un secret ne se recopie jamais dans une note** :
+mot de passe, code d'accès, clé d'API, jeton, code PIN. Cela vaut pour l'import des
+anciennes notes comme pour tout le reste.
+
+À la place, on écrit une **mention utile** qui garde le fait sans la valeur, par exemple :
+
+> Un mot de passe pour la box existait dans les anciennes notes ; il n'a pas été recopié ici.
+
+- La mention dit **qu'il existe**, **à quoi il sert** et **où le retrouver** (gestionnaire de
+  mots de passe, carnet, étiquette sous l'appareil) — jamais sa valeur.
+- Rien d'autre n'est supprimé en silence : ce qui n'a pas été recopié pour cette raison est
+  listé à part, dans la section « Retiré : » demandée pendant l'import, et `cerveau
+  --importer` l'affiche à la fin de chaque lot. Sans rien à signaler : « Retiré : rien ».

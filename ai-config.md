@@ -76,9 +76,12 @@ les répertoires de travail où tu es lancé, et tu y travailles normalement.
 
 Si le dossier `.a-importer/` existe à la racine du cerveau et contient des `lot-*.md`, c'est
 qu'une importation d'anciennes notes a été interrompue. **Finis le travail avant toute autre
-chose** : lis le premier lot, réécris son contenu en notes propres dans `notes/` (une note
-par projet, sans chemin absolu, avec `machine:`), mets `notes/MEMORY.md` à jour, puis
-supprime le lot. Répète pour chaque lot restant, puis lance `cerveau`. Si tu ne peux pas
+chose** : lis les lots un par un, réécris leur contenu en notes propres dans `notes/` (une
+note par projet, sans chemin absolu, avec `machine:`), mets `notes/MEMORY.md` à jour, puis
+supprime le lot. Continue avec chaque lot restant, puis lance `cerveau`. Ne recopie jamais
+la **valeur** d'un mot de passe, d'un code d'accès, d'une clé d'API, d'un jeton ou d'un code
+PIN (le dépôt part sur GitHub) : écris une mention utile à la place, et liste ce que tu n'as
+pas recopié dans une section « Retiré : » à la fin de ta réponse. Si tu ne peux pas
 terminer, dis-le-moi clairement : le sas sera traité à la prochaine occasion par
 `cerveau --importer`.
 

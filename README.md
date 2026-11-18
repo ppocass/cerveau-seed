@@ -54,7 +54,8 @@ qu'il pourra transmettre tel quel à la personne qui lui a donné ce cerveau :
 - le message d'erreur **complet**, recopié sans le résumer ;
 - le système (`uname -a`, distribution, versions de `git`, `gh`, `python3`, `claude`) ;
 - ce qui a déjà été modifié sur la machine (`~/cerveau`, `~/.claude/CLAUDE.md`,
-  `~/.claude/settings.json`) et le nom du dossier de sauvegarde posé sur le Bureau.
+  `~/.claude/settings.json`, `~/.profile` / `~/.bashrc`) et le nom du dossier de sauvegarde
+  posé sur le Bureau.
 
 ---
 
